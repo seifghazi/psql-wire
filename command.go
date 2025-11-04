@@ -57,6 +57,9 @@ type Session struct {
 	Statements StatementCache
 	Portals    PortalCache
 	Attributes map[string]interface{}
+
+	// Pipeline mode: Track pending executions for deferred processing
+	pendingExecutions []ExecutionRequest
 }
 
 // consumeCommands consumes incoming commands sent over the Postgres wire connection.
@@ -178,13 +181,10 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
 		return srv.handleDescribe(ctx, reader, writer)
 	case types.ClientSync:
-		// TODO: Include the ability to catch sync messages in order to
-		// close the current transaction.
-		//
 		// At completion of each series of extended-query messages, the frontend
 		// should issue a Sync message. This parameterless message causes the
 		// backend to close the current transaction if it's not inside a
-		// BEGIN/COMMIT transaction block (“close” meaning to commit if no
+		// BEGIN/COMMIT transaction block ("close" meaning to commit if no
 		// error, or roll back if error). Then a ReadyForQuery response is
 		// issued. The purpose of Sync is to provide a resynchronization point
 		// for error recovery. When an error is detected while processing any
@@ -195,7 +195,7 @@ func (srv *Session) handleCommand(ctx context.Context, conn net.Conn, t types.Cl
 		// — this ensures that there is one and only one ReadyForQuery sent for
 		// each Sync.)
 		// https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
-		return readyForQuery(writer, types.ServerIdle)
+		return srv.handleSync(ctx, reader, writer)
 	case types.ClientBind:
 		return srv.handleBind(ctx, reader, writer)
 	case types.ClientFlush:
@@ -352,7 +352,10 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 		return err
 	}
 
-	srv.logger.Debug("incoming describe request", slog.String("type", types.DescribeMessage(d[0]).String()), slog.String("name", name))
+	srv.logger.Debug("describe message received",
+		slog.String("type", types.DescribeMessage(d[0]).String()),
+		slog.String("name", name),
+		slog.Int("pending_executions", len(srv.pendingExecutions)))
 
 	switch types.DescribeMessage(d[0]) {
 	case types.DescribeStatement:
@@ -382,7 +385,11 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 			return ErrorCode(writer, errors.New("unknown portal"))
 		}
 
-		return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
+		// ALWAYS send NoData for portal describes
+		// The actual RowDescription will come with the data during Execute/Sync
+		// This prevents empty result sets in pipeline mode
+		writer.Start(types.ServerNoData)
+		return writer.End()
 	}
 
 	return ErrorCode(writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
@@ -542,29 +549,156 @@ func (srv *Session) readColumnTypes(reader *buffer.Reader) ([]FormatCode, error)
 }
 
 func (srv *Session) handleExecute(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
+	srv.logger.Debug("execute message received")
+
 	if srv.Statements == nil {
 		return ErrorCode(writer, NewErrUnimplementedMessageType(types.ClientExecute))
 	}
 
-	name, err := reader.GetString()
+	// Check pipeline depth limit
+	if len(srv.pendingExecutions) >= MaxPipelineQueries {
+		return ErrorCode(writer, fmt.Errorf("pipeline depth limit exceeded (%d queries)", MaxPipelineQueries))
+	}
+
+	portalName, err := reader.GetString()
 	if err != nil {
 		return err
 	}
 
-	// NOTE: maximum number of limit to return, if portal contains a
-	// query that returns limit (ignored otherwise). Zero denotes “no limit”.
-	limit, err := reader.GetUint32()
+	rowLimit, err := reader.GetUint32()
 	if err != nil {
 		return err
 	}
 
-	srv.logger.Debug("executing", slog.String("name", name), slog.Uint64("limit", uint64(limit)))
-	err = srv.Portals.Execute(ctx, name, Limit(limit), reader, writer)
+	// Get portal before spawning goroutine to avoid mutex contention
+	portal, err := srv.Portals.Get(ctx, portalName)
 	if err != nil {
-		return ErrorCode(writer, err)
+		srv.pendingExecutions = append(srv.pendingExecutions, ExecutionRequest{
+			Name:       portalName,
+			Portal:     nil,
+			ResultChan: makeErrorChannel(err),
+		})
+		return nil
 	}
+
+	if portal == nil {
+		srv.pendingExecutions = append(srv.pendingExecutions, ExecutionRequest{
+			Name:       portalName,
+			Portal:     nil,
+			ResultChan: makeErrorChannel(fmt.Errorf("portal %s does not exist", portalName)),
+		})
+		return nil
+	}
+
+	resultChan := make(chan *ResultCollector, 1)
+	request := ExecutionRequest{
+		Name:       portalName,
+		Portal:     portal,
+		ResultChan: resultChan,
+	}
+
+	srv.pendingExecutions = append(srv.pendingExecutions, request)
+
+	srv.logger.Debug("starting parallel execution immediately",
+		slog.String("name", portalName),
+		slog.Uint64("limit", uint64(rowLimit)),
+		slog.Int("pending_count", len(srv.pendingExecutions)))
+
+	// Detached context preserves values (user info, tracing) but removes cancellation
+	detachedCtx := context.WithoutCancel(ctx)
+	go srv.executeAsync(detachedCtx, portal, Limit(rowLimit), resultChan)
 
 	return nil
+}
+
+func (srv *Session) executeAsync(ctx context.Context, portal *Portal, limit Limit, resultChan chan *ResultCollector) {
+	defer func() {
+		if r := recover(); r != nil {
+			collector := &ResultCollector{}
+			collector.SetError(fmt.Errorf("panic during execution: %v", r))
+			resultChan <- collector
+		}
+	}()
+
+	srv.logger.Debug("starting async execution",
+		slog.Bool("has_function", portal.statement.fn != nil))
+
+	collectorWriter := NewCollectorDataWriter(ctx, portal.statement.columns, portal.formats, limit)
+	err := portal.statement.fn(ctx, collectorWriter, portal.parameters)
+
+	collector := collectorWriter.Collector()
+	if err != nil {
+		collector.SetError(err)
+	}
+
+	srv.logger.Debug("async execution complete",
+		slog.Bool("has_error", collector.GetError() != nil),
+		slog.Int("rows", int(collector.Written())))
+
+	resultChan <- collector
+}
+
+func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, writer *buffer.Writer) error {
+	srv.logger.Debug("sync message received",
+		slog.Int("pending_executions", len(srv.pendingExecutions)))
+
+	for i, request := range srv.pendingExecutions {
+		srv.logger.Debug("waiting for execution result",
+			slog.Int("index", i),
+			slog.String("portal_name", request.Name))
+
+		select {
+		case <-ctx.Done():
+			srv.logger.Warn("context cancelled during sync",
+				slog.Int("completed", i),
+				slog.Int("total", len(srv.pendingExecutions)))
+			return ctx.Err()
+		default:
+		}
+
+		result := <-request.ResultChan
+
+		if result.GetError() != nil {
+			srv.logger.Debug("execution failed",
+				slog.Int("index", i),
+				slog.String("portal_name", request.Name),
+				slog.String("error", result.GetError().Error()))
+
+			if err := ErrorCode(writer, result.GetError()); err != nil {
+				return err
+			}
+		} else {
+			var formats []FormatCode
+			if request.Portal != nil {
+				formats = request.Portal.formats
+			}
+
+			if err := srv.writeColumnDescription(ctx, writer, formats, result.Columns()); err != nil {
+				return err
+			}
+
+			replayWriter := NewDataWriter(ctx, result.Columns(), formats, NoLimit, nil, writer)
+			if err := result.Replay(ctx, replayWriter); err != nil {
+				srv.logger.Error("failed to replay results",
+					slog.Int("index", i),
+					slog.String("portal_name", request.Name),
+					slog.String("error", err.Error()))
+				return err
+			}
+
+			srv.logger.Debug("execution succeeded",
+				slog.Int("index", i),
+				slog.String("portal_name", request.Name),
+				slog.Int("rows", int(result.Written())))
+		}
+	}
+
+	srv.logger.Debug("sync complete",
+		slog.Int("total_queries", len(srv.pendingExecutions)))
+
+	srv.pendingExecutions = nil
+
+	return readyForQuery(writer, types.ServerIdle)
 }
 
 func (srv *Session) handleConnTerminate(ctx context.Context) error {
