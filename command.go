@@ -385,11 +385,14 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 			return ErrorCode(writer, errors.New("unknown portal"))
 		}
 
-		// ALWAYS send NoData for portal describes
-		// The actual RowDescription will come with the data during Execute/Sync
-		// This prevents empty result sets in pipeline mode
-		writer.Start(types.ServerNoData)
-		return writer.End()
+		// Optionally send NoData for portal describes to avoid clients (like the Ruby pg gem)
+		// treating the RowDescription as an empty result set. The actual RowDescription
+		// will be sent with the data during Execute/Sync.
+		// See: [TODO: add link to issue]
+		// writer.Start(types.ServerNoData)
+		// return writer.End()
+
+		return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
 	}
 
 	return ErrorCode(writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
