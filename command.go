@@ -385,12 +385,11 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 			return ErrorCode(writer, errors.New("unknown portal"))
 		}
 
-		// Optionally send NoData for portal describes to avoid clients (like the Ruby pg gem)
-		// treating the RowDescription as an empty result set. The actual RowDescription
-		// will be sent with the data during Execute/Sync.
+		// ALWAYS send NoData for portal describes
+		// The actual RowDescription will come with the data during Execute/Sync
+		// This prevents empty result sets in pipeline mode
 		writer.Start(types.ServerNoData)
 		return writer.End()
-
 		// return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
 	}
 
@@ -644,6 +643,9 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 	srv.logger.Debug("sync message received",
 		slog.Int("pending_executions", len(srv.pendingExecutions)))
 
+	// Detect if this is non-pipeline mode (single query) vs pipeline mode (multiple queries)
+	isPipelineMode := len(srv.pendingExecutions) > 1
+
 	for i, request := range srv.pendingExecutions {
 		srv.logger.Debug("waiting for execution result",
 			slog.Int("index", i),
@@ -675,8 +677,13 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 				formats = request.Portal.formats
 			}
 
-			if err := srv.writeColumnDescription(ctx, writer, formats, result.Columns()); err != nil {
-				return err
+			// In pipeline mode, send RowDescription with the data
+			// In non-pipeline mode, RowDescription should have been sent by Execute
+			// But since we deferred Execute, we need to send it here for non-pipeline too
+			if isPipelineMode {
+				if err := srv.writeColumnDescription(ctx, writer, formats, result.Columns()); err != nil {
+					return err
+				}
 			}
 
 			replayWriter := NewDataWriter(ctx, result.Columns(), formats, NoLimit, nil, writer)
@@ -696,7 +703,8 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 	}
 
 	srv.logger.Debug("sync complete",
-		slog.Int("total_queries", len(srv.pendingExecutions)))
+		slog.Int("total_queries", len(srv.pendingExecutions)),
+		slog.Bool("was_pipeline_mode", isPipelineMode))
 
 	srv.pendingExecutions = nil
 
