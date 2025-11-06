@@ -7,11 +7,25 @@ import (
 	"sync"
 )
 
+// BufferedPortalDescribe represents a portal RowDescription captured at Describe time.
+// It is paired with the next Execute in FIFO order and may be emitted early if a Flush occurs.
+type BufferedPortalDescribe struct {
+	Seq     uint64
+	Name    string
+	Formats []FormatCode
+	Columns Columns
+	Sent    bool
+	Used    bool
+}
+
 // ExecutionRequest tracks a query execution between Execute and Sync
 type ExecutionRequest struct {
 	Name       string
 	Portal     *Portal
 	ResultChan chan *ResultCollector
+
+	// Optional: linked portal describe captured before Execute. May be nil.
+	Describe *BufferedPortalDescribe
 }
 
 // ResultCollector implements DataWriter interface
