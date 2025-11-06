@@ -721,14 +721,20 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 				formats = request.Portal.formats
 			}
 
-			// Emit RowDescription if needed (not already sent via Flush or Describe Statement)
-			needRowDesc := len(result.Columns()) > 0
-			if request.Describe != nil && request.Describe.Sent {
-				needRowDesc = false
-			}
-			if needRowDesc && request.Portal != nil && srv.statementDescribeRDSent != nil {
-				if srv.statementDescribeRDSent[request.Portal.statement] {
-					needRowDesc = false
+			// Decide whether to emit RowDescription
+			needRowDesc := false
+			if len(result.Columns()) > 0 {
+				if request.Describe != nil {
+					// A portal Describe occurred in this cycle: emit RD unless it was already sent
+					needRowDesc = !request.Describe.Sent
+				} else {
+					// No portal Describe in this cycle: only emit RD if not already sent via Statement Describe
+					needRowDesc = true
+					if request.Portal != nil && srv.statementDescribeRDSent != nil {
+						if srv.statementDescribeRDSent[request.Portal.statement] {
+							needRowDesc = false
+						}
+					}
 				}
 			}
 			if needRowDesc {
