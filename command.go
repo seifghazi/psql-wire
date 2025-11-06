@@ -385,12 +385,12 @@ func (srv *Session) handleDescribe(ctx context.Context, reader *buffer.Reader, w
 			return ErrorCode(writer, errors.New("unknown portal"))
 		}
 
-		// ALWAYS send NoData for portal describes
-		// The actual RowDescription will come with the data during Execute/Sync
-		// This prevents empty result sets in pipeline mode
-		writer.Start(types.ServerNoData)
-		return writer.End()
-		// return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
+		// // ALWAYS send NoData for portal describes
+		// // The actual RowDescription will come with the data during Execute/Sync
+		// // This prevents empty result sets in pipeline mode
+		// writer.Start(types.ServerNoData)
+		// return writer.End()
+		return srv.writeColumnDescription(ctx, writer, portal.formats, portal.statement.columns)
 	}
 
 	return ErrorCode(writer, fmt.Errorf("unknown describe command: %s", string(d[0])))
@@ -678,8 +678,6 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 			}
 
 			// In pipeline mode, send RowDescription with the data
-			// In non-pipeline mode, RowDescription should have been sent by Execute
-			// But since we deferred Execute, we need to send it here for non-pipeline too
 			if isPipelineMode {
 				if err := srv.writeColumnDescription(ctx, writer, formats, result.Columns()); err != nil {
 					return err
