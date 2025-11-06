@@ -714,7 +714,6 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 			// On error during Sync, stop processing further results and send ReadyForQuery
 			srv.pendingExecutions = nil
 			srv.pendingPortalDescribes = nil
-			srv.statementDescribeRDSent = nil
 			return readyForQuery(writer, types.ServerIdle)
 		} else {
 			var formats []FormatCode
@@ -750,6 +749,13 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 				return err
 			}
 
+			// If we skipped RowDescription due to a prior Statement Describe, clear the flag now
+			if request.Portal != nil && srv.statementDescribeRDSent != nil {
+				if srv.statementDescribeRDSent[request.Portal.statement] {
+					delete(srv.statementDescribeRDSent, request.Portal.statement)
+				}
+			}
+
 			srv.logger.Debug("execution succeeded",
 				slog.Int("index", i),
 				slog.String("portal_name", request.Name),
@@ -763,7 +769,6 @@ func (srv *Session) handleSync(ctx context.Context, reader *buffer.Reader, write
 
 	srv.pendingExecutions = nil
 	srv.pendingPortalDescribes = nil
-	srv.statementDescribeRDSent = nil
 
 	return readyForQuery(writer, types.ServerIdle)
 }
